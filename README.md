@@ -5,6 +5,6 @@ V4:
   
 Previous Versions:  
 V2:  
-Murmur is showed as an oscillatory wave in the audio waveform  
+- Murmur is showed as an oscillatory wave in the audio waveform  
 V3:  
-Oscillatory wave is changed into filled envelope band  
+- Oscillatory wave is changed into filled envelope band  
