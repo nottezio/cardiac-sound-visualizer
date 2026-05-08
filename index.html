@@ -577,6 +577,90 @@ function playMurmur(startTime, endTime, shape, intensity, freqLow, freqHigh) {
 }
 
 /* ============= MANEUVER ============= */
+/* =========================================================================
+   S2 SPLIT — semantic representation
+   Returns { leading, trailing } where each is { type: 'A2'|'P2', phase, intensity, freq, isPath }
+   - leading = the EARLIER component (always plays first)
+   - trailing = the LATER component (always plays second)
+   - phase values use main S2 anchor at LM.S2 = 0.40, expanded by splitDuration
+   - isPath flag determines color (amber if pathological component)
+   PHYSIOLOGY:
+   - Normal: leading = A2, trailing = P2 (LV ejection ends before RV)
+   - Paradoxical (severe AS, LBBB): leading = P2, trailing = A2 (LV ejection prolonged)
+   - Wide (ASD, PS, RBBB): leading = A2, trailing = P2, but interval >> normal
+   - Fixed (ASD): same as wide but does not vary with respiration
+   ========================================================================= */
+function getS2Components(cond) {
+  const splitDur = Math.abs(cond.s2.split || 0);
+  const sType = cond.s2.splitType;
+  const isParadoxical = sType === 'paradoxical' || (cond.s2.split || 0) < -0.005;
+  const isFixed = sType === 'fixed';
+  const isWide = splitDur > 0.050 && !isParadoxical;
+  const isPathSplit = isFixed || isParadoxical || isWide;
+
+  // Anchor: leading component lands at LM.S2, trailing at LM.S2 + splitDur
+  // (phase position is "where on the timeline" — first sound user hears anchored at S2)
+  const leadingPhase = LM.S2;
+  const trailingPhase = LM.S2 + splitDur;
+
+  // Default intensities
+  const baseIntensity = cond.s2.intensity;
+  const baseFreq = cond.s2.freq;
+
+  let leading, trailing;
+  if (isParadoxical) {
+    // P2 first (normal RV timing), A2 second (delayed by stenosis/LBBB)
+    leading = {
+      type: 'P2',
+      phase: leadingPhase,
+      intensity: baseIntensity * 0.85,  // P2 is normally softer than A2
+      freq: baseFreq * 1.05,             // P2 slightly higher pitch
+      isPath: false,                      // P2 itself is normal — A2 is the pathological one
+    };
+    trailing = {
+      type: 'A2',
+      phase: trailingPhase,
+      intensity: baseIntensity,
+      freq: baseFreq,
+      isPath: true,                       // delayed A2 = the pathological component
+    };
+  } else {
+    // Normal ordering: A2 first, P2 second
+    leading = {
+      type: 'A2',
+      phase: leadingPhase,
+      intensity: baseIntensity,
+      freq: baseFreq,
+      isPath: false,                      // A2 always normal in non-paradoxical
+    };
+    trailing = {
+      type: 'P2',
+      phase: trailingPhase,
+      intensity: baseIntensity * 0.85,
+      freq: baseFreq * 1.05,
+      // P2 is pathological if: fixed split, wide split (>50 ms)
+      isPath: isFixed || isWide,
+    };
+  }
+
+  // Special case: PS — P2 is reduced AND delayed (soft, late)
+  if (currentCondKey === 'ps') {
+    if (trailing.type === 'P2') {
+      trailing.intensity *= 0.5;          // soft P2 (Berne & Levy: P2 is diminished in severe PS)
+      trailing.isPath = true;
+    }
+  }
+
+  // Special case: AS — A2 is reduced (soft/absent due to immobile valve)
+  if (currentCondKey === 'as') {
+    if (trailing.type === 'A2') {
+      trailing.intensity *= 0.6;          // soft A2 — classic AS finding
+    }
+  }
+
+  return { leading, trailing, isPathSplit, splitDur };
+}
+
 function applyManeuver(condKey, maneuver) {
   const c = JSON.parse(JSON.stringify(CONDITIONS[condKey]));
   c.maneuverNote = c.maneuverNote || '';
@@ -584,19 +668,41 @@ function applyManeuver(condKey, maneuver) {
   const isParadox = c.s2.splitType === 'paradoxical';
   switch (maneuver) {
     case 'inspiration':
-      if (!isFixed && !isParadox) c.s2.split = (c.s2.split || 0.025) * 2.4;
-      else if (isParadox) c.s2.split = (c.s2.split || -0.025) * 0.4;
+      if (isFixed) {
+        // ASD: split unchanged
+      } else if (isParadox) {
+        // Paradoxical: P2 (which is leading) gets pushed later by inspiration,
+        // catching up to/passing the delayed A2 → split NARROWS
+        // |split| decreases, but stays negative (paradoxical order preserved)
+        c.s2.split = (c.s2.split || -0.025) * 0.35;
+        // If split becomes very small (<5 ms), effectively "single" S2
+        if (Math.abs(c.s2.split) < 0.005) c.s2.split = 0;
+      } else {
+        // Normal physiology: split widens
+        c.s2.split = (c.s2.split || 0.025) * 2.4;
+      }
       if (c.murmur?.rightSided) c.murmur.intensity *= 1.45;
       else if (c.murmur) c.murmur.intensity *= 0.85;
       c.maneuverNote = isFixed ? 'Inspiration: S2 split remains FIXED (hallmark of ASD).'
-        : isParadox ? 'Inspiration: paradoxical split NARROWS (P2 catches up to delayed A2).'
+        : isParadox ? 'Inspiration: paradoxical split NARROWS (P2 catches up to delayed A2). May become single S2.'
         : 'Inspiration: ↑ venous return → wider S2 split, ↑ right-sided murmurs (Carvallo sign), ↓ left-sided.';
       break;
     case 'expiration':
-      if (!isFixed) c.s2.split = (c.s2.split || 0.025) * 0.3;
+      if (isFixed) {
+        // ASD: unchanged
+      } else if (isParadox) {
+        // Paradoxical: P2 returns earlier → A2 still delayed → split WIDENS again
+        // (paradoxical split is widest in expiration — opposite of normal)
+        c.s2.split = (c.s2.split || -0.025) * 1.6;
+      } else {
+        // Normal: split narrows
+        c.s2.split = (c.s2.split || 0.025) * 0.3;
+      }
       if (c.murmur && !c.murmur.rightSided) c.murmur.intensity *= 1.15;
       if (c.murmur?.rightSided) c.murmur.intensity *= 0.7;
-      c.maneuverNote = isFixed ? 'Expiration: S2 split remains FIXED (ASD).' : 'Expiration: narrow/single S2, ↑ left-sided murmurs, ↓ right-sided.';
+      c.maneuverNote = isFixed ? 'Expiration: S2 split remains FIXED (ASD).'
+        : isParadox ? 'Expiration: paradoxical split WIDENS (P2 returns earlier, A2 still delayed) — opposite of normal physiology.'
+        : 'Expiration: narrow/single S2, ↑ left-sided murmurs, ↓ right-sided.';
       break;
     case 'valsalva':
       if (c.murmur?.dynamicLVOT) {
@@ -634,16 +740,18 @@ const SCHEDULE_LOOK_AHEAD = FUTURE_SECONDS + 0.3;
 function scheduleCycleAtVirt(virtCycleStart, cond) {
   const dur = cycleDuration;
   const aT = virtCycleStart + audioStartTime;
-  playThump(aT + 0.03 * dur, cond.s1.freq, 0.10, cond.s1.intensity);
-  const split = cond.s2.split || 0;
-  if (split >= 0) {
-    playThump(aT + 0.40 * dur, cond.s2.freq, 0.07, cond.s2.intensity, true);
-    if (Math.abs(split) > 0.005)
-      playThump(aT + (0.40 + split) * dur, cond.s2.freq * 1.05, 0.07, cond.s2.intensity * 0.8, true);
-  } else {
-    playThump(aT + (0.40 + split) * dur, cond.s2.freq * 1.05, 0.07, cond.s2.intensity * 0.8, true);
-    playThump(aT + 0.40 * dur, cond.s2.freq, 0.07, cond.s2.intensity, true);
+  // S1
+  playThump(aT + LM.S1 * dur, cond.s1.freq, 0.10, cond.s1.intensity);
+
+  // S2: schedule both leading and trailing components from semantic decomposition
+  const s2 = getS2Components(cond);
+  // Leading component
+  playThump(aT + s2.leading.phase * dur, s2.leading.freq, 0.07, s2.leading.intensity, true);
+  // Trailing component (only if split is audible, >5 ms)
+  if (s2.splitDur > 0.005) {
+    playThump(aT + s2.trailing.phase * dur, s2.trailing.freq, 0.07, s2.trailing.intensity, true);
   }
+
   if (cond.s3) playThump(aT + 0.55 * dur, cond.s3.freq, 0.10, cond.s3.intensity);
   if (cond.s4) playThump(aT + 0.92 * dur, cond.s4.freq, 0.08, cond.s4.intensity);
   if (cond.openingSnap) playThump(aT + cond.openingSnap.time * dur, cond.openingSnap.freq, 0.04, cond.openingSnap.intensity, true);
@@ -708,21 +816,20 @@ function heartSoundComponents(t, cond) {
     return amp * env * Math.sin(2 * Math.PI * fHz * dt);
   }
 
-  // S1 — always normal channel (intensity changes are noted in text, not color)
-  normal += pulse(cs + 0.03 * dur, 0.110, cond.s1.intensity * 0.9, 18);
+  // S1 — always normal channel
+  normal += pulse(cs + LM.S1 * dur, 0.110, cond.s1.intensity * 0.9, 18);
 
-  // S2 main (A2) — always normal
-  normal += pulse(cs + 0.40 * dur, 0.085, cond.s2.intensity * 0.85, 22);
-
-  // S2 second component (P2 if delayed, A2 if paradoxical) — color depends on split type
-  const split = cond.s2.split || 0;
-  if (Math.abs(split) > 0.005) {
-    const sType = cond.s2.splitType;
-    // Pathological if: fixed split, paradoxical split, or wide split (>0.05)
-    const isPathSplit = sType === 'fixed' || sType === 'paradoxical' || Math.abs(split) > 0.050;
-    const p2Pulse = pulse(cs + (0.40 + split) * dur, 0.085, cond.s2.intensity * 0.7, 22);
-    if (isPathSplit) path += p2Pulse;
-    else normal += p2Pulse;
+  // S2: render leading + trailing components from semantic decomposition
+  const s2 = getS2Components(cond);
+  // Leading component
+  const leadingPulse = pulse(cs + s2.leading.phase * dur, 0.085, s2.leading.intensity * 0.85, 22);
+  if (s2.leading.isPath) path += leadingPulse;
+  else normal += leadingPulse;
+  // Trailing component (only if split is audible)
+  if (s2.splitDur > 0.005) {
+    const trailingPulse = pulse(cs + s2.trailing.phase * dur, 0.085, s2.trailing.intensity * 0.85, 22);
+    if (s2.trailing.isPath) path += trailingPulse;
+    else normal += trailingPulse;
   }
 
   // All extra sounds → pathological channel
@@ -836,28 +943,40 @@ function drawSoundLabels(cond) {
   ctx.textAlign = 'center';
   const firstCycle = Math.floor(startTime / dur) * dur;
 
-  const split = cond.s2.split || 0;
-  const sType = cond.s2.splitType;
-  const isPathSplit = sType === 'fixed' || sType === 'paradoxical' || Math.abs(split) > 0.050;
   const PATH = '#fb923c';
   const NORM = '#34d399';
 
+  // Semantic S2 decomposition
+  const s2 = getS2Components(cond);
+
   for (let cycT = firstCycle; cycT < endTime + dur; cycT += dur) {
     const sounds = [
-      { phase: 0.03, label: 'S1', color: NORM },
-      { phase: 0.40, label: 'S2', color: NORM },
+      { phase: LM.S1, label: 'S1', color: NORM },
     ];
+
+    // S2 labeling — split-aware
+    if (s2.splitDur > 0.005) {
+      // Show BOTH components with correct labels and colors
+      sounds.push({
+        phase: s2.leading.phase,
+        label: s2.leading.type,
+        color: s2.leading.isPath ? PATH : NORM,
+      });
+      sounds.push({
+        phase: s2.trailing.phase,
+        label: s2.trailing.type,
+        color: s2.trailing.isPath ? PATH : NORM,
+      });
+    } else {
+      // Single S2 (no audible split) — show as "S2"
+      sounds.push({ phase: LM.S2, label: 'S2', color: NORM });
+    }
+
     if (cond.s3) sounds.push({ phase: 0.55, label: 'S3', color: PATH });
     if (cond.s4) sounds.push({ phase: 0.92, label: 'S4', color: PATH });
     if (cond.openingSnap) sounds.push({ phase: cond.openingSnap.time, label: 'OS', color: PATH });
     if (cond.midSystolicClick) sounds.push({ phase: cond.midSystolicClick.time, label: 'C', color: PATH });
-    if (Math.abs(split) > 0.005) {
-      sounds.push({
-        phase: 0.40 + split,
-        label: split < 0 ? 'A2' : 'P2',
-        color: isPathSplit ? PATH : NORM,
-      });
-    }
+
     for (const s of sounds) {
       const x = (cycT + s.phase * dur - startTime) * pxPerSec;
       if (x < -10 || x > canvasW + 10) continue;
@@ -1156,14 +1275,22 @@ function detectPathElement(phase, cond) {
     return PATH_EXPLANATIONS.os;
   if (cond.midSystolicClick && Math.abs(phase - cond.midSystolicClick.time) < tolerance)
     return PATH_EXPLANATIONS.click;
-  // Pathological S2 split component
-  const split = cond.s2.split || 0;
-  const sType = cond.s2.splitType;
-  if (Math.abs(split) > 0.005 && Math.abs(phase - (0.40 + split)) < tolerance) {
-    if (sType === 'fixed') return PATH_EXPLANATIONS.splitFixed;
-    if (sType === 'paradoxical') return PATH_EXPLANATIONS.splitParadox;
-    if (Math.abs(split) > 0.050) return PATH_EXPLANATIONS.splitWide;
+
+  // Pathological S2 split — check whichever component is the pathological one
+  const s2 = getS2Components(cond);
+  if (s2.splitDur > 0.005) {
+    const sType = cond.s2.splitType;
+    // Determine which component user is hovering near
+    const nearLeading = Math.abs(phase - s2.leading.phase) < tolerance;
+    const nearTrailing = Math.abs(phase - s2.trailing.phase) < tolerance;
+    if ((nearLeading && s2.leading.isPath) || (nearTrailing && s2.trailing.isPath) ||
+        (s2.isPathSplit && (nearLeading || nearTrailing))) {
+      if (sType === 'fixed') return PATH_EXPLANATIONS.splitFixed;
+      if (sType === 'paradoxical') return PATH_EXPLANATIONS.splitParadox;
+      if (s2.splitDur > 0.050) return PATH_EXPLANATIONS.splitWide;
+    }
   }
+
   // Murmur window
   if (cond.murmur) {
     const m = cond.murmur;
@@ -1171,7 +1298,6 @@ function detectPathElement(phase, cond) {
       const key = `murmur_${m.shape}_${m.phase}`;
       if (PATH_EXPLANATIONS[key]) return PATH_EXPLANATIONS[key];
     }
-    // msRumble extends to end of cycle (1.0); also covers wrap-around
     if (m.shape === 'msRumble' && phase >= m.start) {
       return PATH_EXPLANATIONS['murmur_msRumble_diastolic'];
     }
@@ -1995,14 +2121,18 @@ function drawWiggers(cond) {
   ctx.textAlign = 'center';
   const PATH = '#fb923c';
   const NORM = '#34d399';
-  const split = cond.s2.split || 0;
-  const sType = cond.s2.splitType;
-  const isPathSplit = sType === 'fixed' || sType === 'paradoxical' || Math.abs(split) > 0.050;
+  const s2 = getS2Components(cond);
   for (let cycT = firstCycle; cycT < endTime + dur; cycT += dur) {
     const sounds = [
-      { phase: 0.03, label: 'S1', color: NORM },
-      { phase: 0.40, label: 'S2', color: NORM },
+      { phase: LM.S1, label: 'S1', color: NORM },
     ];
+    // S2 split-aware
+    if (s2.splitDur > 0.005) {
+      sounds.push({ phase: s2.leading.phase, label: s2.leading.type, color: s2.leading.isPath ? PATH : NORM });
+      sounds.push({ phase: s2.trailing.phase, label: s2.trailing.type, color: s2.trailing.isPath ? PATH : NORM });
+    } else {
+      sounds.push({ phase: LM.S2, label: 'S2', color: NORM });
+    }
     if (cond.s3) sounds.push({ phase: 0.55, label: 'S3', color: PATH });
     if (cond.s4) sounds.push({ phase: 0.92, label: 'S4', color: PATH });
     if (cond.openingSnap) sounds.push({ phase: cond.openingSnap.time, label: 'OS', color: PATH });
